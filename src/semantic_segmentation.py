@@ -39,54 +39,87 @@ augmentation = A.Compose([
     A.RandomGamma(p=0.8)
 ])
 
+UNLABELED_CLASS = 5  # index of the "Unlabeled" class in the 6-class scheme
+
 class CustomDataset(tf.keras.utils.Sequence):
-    def __init__(self, df, root_dir, batch_size=16, target_size=(256, 256), n_classes=6, augmentation=None):
-        self.df = df
+    def __init__(self, df, root_dir, batch_size=16, target_size=(256, 256), n_classes=6,
+                 augmentation=None, shuffle=False, preprocess=True):
+        super().__init__()
+        self.df = df.reset_index(drop=True)
         self.root_dir = root_dir
         self.batch_size = batch_size
         self.target_size = target_size
         self.n_classes = n_classes
         self.augmentation = augmentation
+        self.shuffle = shuffle
+        # preprocess=True feeds the network; preprocess=False returns raw RGB for plotting.
+        self.preprocess = preprocess
+        self._warned_out_of_range = False
+        if self.shuffle:
+            self.on_epoch_end()
 
     def __len__(self):
         return int(np.ceil(len(self.df) / self.batch_size))
 
+    def on_epoch_end(self):
+        # Reshuffle between epochs so batches are not seen in the same order every time.
+        if self.shuffle:
+            self.df = self.df.sample(frac=1.0).reset_index(drop=True)
+
     def __getitem__(self, idx):
         batch_df = self.df.iloc[idx * self.batch_size:(idx + 1) * self.batch_size]
-        
+
         images = []
         masks = []
 
         for i, row in batch_df.iterrows():
             img_path = os.path.join(self.root_dir, row['sat_image_path'])
             mask_path = os.path.join(self.root_dir, row['mask_path'])
-            
-            img = np.array(Image.open(img_path))
+
+            # Force 3-channel RGB: some PNGs are RGBA or greyscale.
+            img = np.array(Image.open(img_path).convert('RGB'))
             mask = np.array(Image.open(mask_path))
 
             if len(mask.shape) == 3:
                 mask = mask[..., 0]
+
+            # Values outside 0..n_classes-1 would crash one-hot encoding (they come from
+            # datasets whose masks use a different label scheme). Treat them as Unlabeled
+            # and warn once, so the problem is visible instead of silent.
+            out_of_range = mask >= self.n_classes
+            if out_of_range.any():
+                if not self._warned_out_of_range:
+                    print(f"Warning: mask values >= {self.n_classes} found (e.g. {mask_path}); "
+                          f"mapping them to Unlabeled. Remap these datasets to the shared classes.")
+                    self._warned_out_of_range = True
+                mask = mask.copy()
+                mask[out_of_range] = UNLABELED_CLASS
 
             if self.augmentation:
                 augmented = self.augmentation(image=img, mask=mask)
                 img = augmented['image']
                 mask = augmented['mask']
 
-            img = tf.image.resize(img, self.target_size)
+            img = tf.image.resize(img, self.target_size).numpy()
+            if self.preprocess:
+                # Match the normalisation the ImageNet-pretrained ResNet50 encoder was trained with.
+                img = tf.keras.applications.resnet50.preprocess_input(img)
             mask = tf.expand_dims(mask, axis=-1)
             mask = tf.image.resize(mask, self.target_size, method='nearest')
             mask = tf.squeeze(mask, axis=-1)
 
             images.append(img)
-            
+
             # One-hot encode the mask
             mask_one_hot = tf.keras.utils.to_categorical(mask, num_classes=self.n_classes)
             masks.append(mask_one_hot)
 
         return np.array(images), np.array(masks)
-    
-def get_dataset(df, root_dir, batch_size=16, target_size=(256, 256), n_classes=6, augmentation=None, shuffle=True):
-    dataset = CustomDataset(df, root_dir, batch_size, target_size, n_classes, augmentation)
+
+def get_dataset(df, root_dir, batch_size=16, target_size=(256, 256), n_classes=6, augmentation=None,
+                shuffle=True, preprocess=True):
+    dataset = CustomDataset(df, root_dir, batch_size, target_size, n_classes, augmentation,
+                            shuffle=shuffle, preprocess=preprocess)
     return dataset
 
 train_dataset = get_dataset(train_df, DATA_DIR, augmentation=augmentation)
@@ -152,7 +185,11 @@ model = get_model('Unet')
 # Learning rate scheduler
 lr_schedule = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
 
-model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss=total_loss, metrics=['accuracy', dice_coefficient, tf.keras.metrics.MeanIoU(num_classes=6)])
+# OneHotMeanIoU takes one-hot labels and softmax outputs and applies argmax internally.
+# (Plain MeanIoU expects class indices, so it gave a misleading number on this model's outputs.)
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss=total_loss,
+              metrics=['accuracy', dice_coefficient,
+                       tf.keras.metrics.OneHotMeanIoU(num_classes=6, name='mean_iou')])
 
 history = model.fit(
     train_dataset, 
@@ -167,8 +204,8 @@ history = model.fit(
 
 plt.figure(figsize=(12, 4))
 plt.subplot(1, 2, 1)
-plt.plot(history.history['mean_io_u'])
-plt.plot(history.history['val_mean_io_u'])
+plt.plot(history.history['mean_iou'])
+plt.plot(history.history['val_mean_iou'])
 plt.title('Model IOU Score')
 plt.ylabel('IOU Score')
 plt.xlabel('Epoch')
@@ -184,16 +221,24 @@ plt.legend(['Train', 'Val'], loc='upper left')
 
 plt.show()
 
-results = model.evaluate(test_dataset)
+# return_dict=True looks metrics up by name. The old code printed results[1], which is
+# pixel accuracy, under the label "IOU".
+results = model.evaluate(test_dataset, return_dict=True)
 
-print(f'Test IOU Score: {results[1]}')
-print(f'Test Loss: {results[0]}')
+print(f"Test mIoU: {results['mean_iou']:.4f}")
+print(f"Test Dice: {results['dice_coefficient']:.4f}")
+print(f"Test pixel accuracy: {results['accuracy']:.4f}")
+print(f"Test loss: {results['loss']:.4f}")
 
-def plot_predictions(model, dataset):
+def plot_predictions(model, df):
     n_images = 5
-    
-    images, masks = dataset[0]
-    preds = model.predict(images)
+
+    # Raw RGB for display; the same images preprocessed for the model.
+    raw_images, masks = get_dataset(df, DATA_DIR, shuffle=False, preprocess=False)[0]
+    model_images = tf.keras.applications.resnet50.preprocess_input(raw_images.copy())
+    preds = model.predict(model_images)
+    n_images = min(n_images, len(raw_images))
+    images = raw_images.astype('uint8')
     
     plt.figure(figsize=(20, 10))
     
@@ -215,5 +260,5 @@ def plot_predictions(model, dataset):
         
     plt.show()
 
-plot_predictions(model, test_dataset)
+plot_predictions(model, test_df)
 
